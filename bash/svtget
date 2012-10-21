@@ -33,6 +33,9 @@
 # Sample usage:
 # ./svtget http://svtplay.se/v/2440756/k_special/presspauseplay
 
+# trap exit (ctrl-c) and kill worker processes
+trap 'kill $(jobs -p) 2>/dev/null' EXIT
+
 if [ `uname` == "Darwin" ]; then
     SED=gsed
 else
@@ -45,11 +48,17 @@ svtplay_url="http://www.svtplay.se"
 play=""
 subtitles=""
 debug=""
+keep_temp_files=""
+num_workers=8
 # change these in case you find something working better for you.
 # you can also give them as argument using flag -f "-vcodec copy..."
-ffmpeg_flags="-vcodec copy -strict experimental"
+# if you have problems with ffmpeg, try replaceing '-acodec....' with 
+# '-strict experimental'
+# this will increase the time needed for muxing since audio is modified.
+ffmpeg_flags="-f mp4 -vcodec copy -acodec copy -absf aac_adtstoasc"
 
-DEPENDENCIES="ffmpeg curl $SED cut bash tr"
+# openssl and hexdump is needed in case you don't pipe straight to player
+DEPENDENCIES="ffmpeg curl $SED cut bash tr openssl hexdump"
 PLAYERS="mplayer vlc"
 for DEP in $DEPENDENCIES; do
 	if [ -z "`which $DEP`" ]; then
@@ -57,7 +66,6 @@ for DEP in $DEPENDENCIES; do
 		exit
 	fi
 done
-    
 
 # Available bitrates: 320 850 1400 2400
 BITRATE=""
@@ -146,7 +154,7 @@ function get_sub {
 	echo $html | $SED -n 's/.*"subtitleReferences":\[{"url":"\([^"]\+\)".*/\1/p'
 }
 
-function print_alligned {
+function print_aligned {
     printf '%-4s' "$1"
     shift
     while [ "$1" ]; do
@@ -161,18 +169,18 @@ function print_alligned {
 }
 
 function pick_tcUrl {
-        print_alligned "#" "Bitrate" "Resolution" "Stream name"
+        print_aligned "#" "Bitrate" "Resolution" "Stream name"
 	let n=1
 	for STREAM in $@; do
 		local BITRATE=`echo $STREAM | cut -d '|' -f 1 -`
 		local RESOLUTION=`echo $STREAM | cut -d '|' -f 2 -`
 		Streams[$n]=`echo $STREAM | cut -d '|' -f 3 -`
 		local NAME=`basename $STREAM | cut -d '?' -f 1 -`
-		print_alligned "$n." "${BITRATE} kbps" "${RESOLUTION}" "$NAME"
+		print_aligned "$n." "${BITRATE} kbps" "${RESOLUTION}" "$NAME"
 		let n++
 	done
 	
-	stream=0
+	local stream=0
 	if [ "$#" -eq 1 ]; then
 		stream=1
 	fi
@@ -183,15 +191,18 @@ function pick_tcUrl {
 			exit
 		fi
 	done
+	echo "" # add some space between print-outs
 	tcUrl=${Streams[$stream]}
 }
 
 function askOverwrite {
-    echo  "The file \"$1\" exists already!"
+    local file=$1
+    echo  "The file \"$file\" exists already!"
     while true; do
 	read -p "Do you want to overwrite? [y/n] " yesno
 	case $yesno in
 	    y* | Y* )
+		rm -rf $file
 		break
 		;;
 	    n* | N* | q )
@@ -201,6 +212,7 @@ function askOverwrite {
 		;;
 	esac
     done
+    echo "" # add some space between print-outs
 }
 
 function print_help {
@@ -209,7 +221,9 @@ function print_help {
 	echo -e " -p\tplay output"
 	echo -e " -s\tfetch subtitles"
 	echo -e " -f\tffmpeg flags"
-	echo -e " -d\Debug, print debug messages and cmd line"
+	echo -e " -c\tnumber of concurrent chunk downloads"
+	echo -e " -x\tdon't clean up temporary files"
+	echo -e " -d\print debug messages and cmd line"
 }
 
 
@@ -234,7 +248,192 @@ function set_mediaplayer {
 }
 
 
-while getopts "q:f:psdh" opt; do
+# This function acts the same as the seq command under Linux.
+# On Mac closest matching command is 'jot' but the arguments differ so
+# it was easier to write an own version
+# Takes 1, 2 or 3 arguments
+function gen_seq {
+    if [ $# -eq 1 ]; then
+	local start=1
+	local inc=1
+	local stop=$1
+    elif [ $# -eq 2 ]; then
+	local start=$1
+	local inc=1
+	local stop=$2
+    else
+	local start=$1
+	local inc=$2
+	local stop=$3
+    fi
+    for ((i=$start; i<=$stop; i+=$inc)); do
+	echo $i
+    done
+}
+
+
+function print_progress {
+    echo "Downloading ts-chunks ($num_workers workers)..."
+    local temp_dir=$1
+    local num_files=$2
+    sleep 1 # give workers a chance to start
+    local counter=`ls ${temp_dir}/*.ts 2>/dev/null | wc -w | tr -d ' '`
+    while [ $counter -le $num_files ]; do
+	if [ $counter -eq $num_files ]; then
+	    echo -e "\r$counter of $num_files chunks finished\n"
+	    break
+	else
+	    echo -e "\r$counter of $num_files chunks finished\c"
+	    sleep 1
+	    counter=`ls ${temp_dir}/*.ts 2>/dev/null | wc -w | tr -d ' '`
+	fi
+    done
+}
+
+
+function worker {
+    local temp_dir=$1
+    local ix_list=$2
+    local hex_key=$3
+    cd "$temp_dir"
+    for ix in $ix_list; do
+	url=${ts_urls[`expr $ix - 1`]}
+	num=`printf '%04d' $ix`
+	file=${num}.ts
+	if [ $hex_key ]; then
+	    xfile=${num}.tsx
+	    curl -s "$url" -o "$xfile"
+	    decrypt_ts $hex_key $ix $xfile $file
+	    if [ -e $file ]; then
+		rm -rf $xfile
+	    else
+		echo "download or decrypt failed! $url"
+		break
+	    fi
+	else
+	    curl -s "$url" -o "$file"
+	    if [ ! -e $file ]; then
+		echo "download failed! $url"
+		break
+	    fi
+	fi
+    done
+    exit 0
+}
+
+
+function get_hex_key {
+    local m3u8=$1
+    local hex_key=""
+    local key_url=`echo "$m3u8" | grep "EXT-X-KEY" | $SED -n 's/.*URI="\([^"]\+\).*/\1/p'`
+    if [ $key_url ]; then
+	curl -s "$key_url" -o "svtget_crypt.key"
+	if [ ! -e "svtget_crypt.key" ]; then
+	    echo "download of crypt.key failed!"
+	    exit 1
+	fi
+	hex_key=`hexdump -e '16/1 "%02x"' svtget_crypt.key`
+	rm -rf "svtget_crypt.key"
+	if [ ! $hex_key ]; then
+	    echo "hexdump failed!"
+	    exit 1
+	else
+	    echo $hex_key
+	fi
+    fi
+}
+
+
+function decrypt_ts {
+    local hex_key=$1
+    local ix=$2
+    local in_file=$3
+    local out_file=$4
+    iv=`printf '%032x' $ix`
+    openssl aes-128-cbc -d -nosalt -iv $iv -K $hex_key -in $in_file -out $out_file
+}
+
+function join_and_mux_ts {
+    echo "Muxing ts-chunks..."
+    local temp_dir=$1
+    local file_prefix=$2
+    local num_files=$3
+    local max_fds=`ulimit -n`
+    local fds_needed=$(($num_files + 8))
+    if [ $max_fds -lt $fds_needed ]; then
+	# setting max number of open file descriptors to double needed. within this scope
+	# if you have any problem with this manually raise max number of open decriptors in .bashrc
+	ulimit -n $fds_needed
+	if [ $? -ne 0 ]; then
+	    echo "Warning: Unable to increase max number of open file descriptors."
+	fi
+    fi
+    local file_list=`ls ${temp_dir}/*.ts`
+    local file_pipe=`echo $file_list | tr ' ' '|'`
+    ffmpeg -i concat:"$file_pipe" $ffmpeg_flags "${file_prefix}.mp4"
+    if [ $? -ne 0 ]; then
+	echo "Failed to join and mux the files."
+    fi
+    if [ ! $keep_temp_files ]; then
+	echo "Cleaning up temporary files..."
+	remove_temporary_files $temp_dir
+    fi
+}
+
+function temp_dir {
+    local file_prefix=$1
+    if [ ! $file_prefix ]; then
+	echo "ERROR: no file-name"
+	exit 1
+    fi
+    echo "${file_prefix}.tmp"
+}
+
+function remove_temporary_files {
+    local temp_dir=$1
+    if  [ -d "$temp_dir" ]; then
+	rm -rf "$temp_dir"
+    fi
+}
+
+
+function parallel_download {
+    local tcUrl=$1
+    local file_prefix=$2
+    local m3u8=`curl -s "$tcUrl"`
+    local hex_key=$(get_hex_key "$m3u8")
+    local ts_urls=(`echo "$m3u8" | grep -v "^#"`)
+    local num_files=${#ts_urls[@]}
+
+    local temp_dir=$(temp_dir $file_prefix)
+    # remove any previous temporary files
+    remove_temporary_files $temp_dir
+    mkdir "$temp_dir"
+    
+    # spawn download- and decrypt-workers
+    for i in $(gen_seq 1 $num_workers); do
+	ix_list=$(gen_seq $i $num_workers $num_files)
+	(worker $temp_dir "$ix_list" $hex_key) &
+    done
+    
+    print_progress $temp_dir $num_files
+    wait; sleep 1 # wait for any remaining process to finish
+
+    join_and_mux_ts $temp_dir $file_prefix $num_files
+}
+
+
+function do_eval {
+    local cmd=$1
+    debug "$cmd"
+    if [ $debug ]; then
+	exit 0
+    fi
+    eval $cmd
+}
+
+
+while getopts "q:f:c:psxdh" opt; do
 	case $opt in
 	q)
 		set_bitrate $OPTARG
@@ -242,12 +441,18 @@ while getopts "q:f:psdh" opt; do
 	f)
 		ffmpeg_flags=$OPTARG
 		;;
+	c)
+		num_workers=$OPTARG
+		;;
 	p)
 	        set_mediaplayer
 		play="true"
 		;;
 	s)
 		subtitles="true"
+		;;
+	x)
+		keep_temp_files="true"
 		;;
 	d)
 		debug="true"
@@ -292,7 +497,7 @@ if [ $m3u8Url ]; then
     is_applehttp="true"
 
 else
-    debug "not applehttp stream, trying rtmp and flv"
+    debug "no applehttp stream, trying rtmp and flv"
     tcUrls=$(get_tcUrlsOLD "$JSON" "$BITRATE")
 fi
 
@@ -312,9 +517,10 @@ else
 fi
 debug "picked tcUrl:\n$tcUrl"
 
-programName="$(echo $JSON | $SED -n 's/.*"folderStructure":"\([^\.]\+\).[^"]\+".*}/\1/p')"
-episodName="$(echo $JSON | $SED -n 's/.*,"title":"\([^"]\+\)".*/\1/p' | $SED 's/-\+$//')"
-filename="${programName}-${episodName}.${extension}"
+programName=$(echo $JSON | $SED -n 's/.*"folderStructure":"\([^\.]\+\).[^"]\+".*}/\1/p')
+episodeName=$(echo $JSON | $SED -n 's/.*,"title":"\([^"]\+\)".*/\1/p' | $SED 's/-\+$//')
+fileprefix="${programName}-${episodeName}"
+filename="${fileprefix}.${extension}"
 debug "filename:\n$filename"
 
 if [ ! $play ] && [ $subtitles ]; then
@@ -324,24 +530,23 @@ if [ ! $play ] && [ $subtitles ]; then
 		echo "No subtitle found."
 		subtitles=""
 	else
-		sub_filename="${programName}-${episodName}.srt"
+		sub_filename="${fileprefix}.srt"
 	fi
 else
 	subUrl=""
 fi
 
-if [ ! $play ] && [ -e "$filename" ] && [ ! $is_applehttp ]; then
-    # ffmpeg will ask if overwrite, so no need if it's an applehttp stream
+if [ ! $play ] && [ -e "$filename" ]; then
     askOverwrite "$filename"
 fi
 
 if [ $play ]; then
     if [ $is_applehttp ]; then
-	CMD="ffmpeg -i \"$tcUrl\" $ffmpeg_flags - | \"$mediaplayer\" - \"$subUrl\" &>/dev/null" 
+	do_eval "ffmpeg -i \"$tcUrl\" $ffmpeg_flags - | \"$mediaplayer\" - \"$subUrl\" &>/dev/null" 
     elif [ $extension == "mp4" ]; then
-	CMD="rtmpdump -r \"$tcUrl\" -W \"$swfUrl\" -o - | \"$mediaplayer\" - \"$subUrl\" &>/dev/null"
+	do_eval "rtmpdump -r \"$tcUrl\" -W \"$swfUrl\" -o - | \"$mediaplayer\" - \"$subUrl\" &>/dev/null"
     elif [ $extension == "flv" ]; then
-	CMD="$mediaplayer \"$tcUrl\" \"$subUrl\" &>/dev/null"
+	do_eval "$mediaplayer \"$tcUrl\" \"$subUrl\" &>/dev/null"
     fi
 else # if [ ! $play ]
     if [ $subtitles ]; then
@@ -351,20 +556,23 @@ else # if [ ! $play ]
 	    curl "$subUrl" -o "$sub_filename"
 	fi
     fi
-    if [ $is_applehttp ]; then
+    if [ $is_applehttp ] && [ $num_workers -gt 1 ]; then
+	# parallel download. default number of workers is 8
+	# this increases the download speed by a factor of up to 8
+	# chunks are downloaded and decrypted manually and then muxed together with ffmpeg
+	debug "parallel_download $tcUrl $fileprefix"
+	if [ ! $debug ]; then
+	    parallel_download $tcUrl $fileprefix
+	fi
+    elif [ $is_applehttp ]; then
         # in case of any problem with segmentation fault. make sure you have latest possibe ffmpeg. on Mac build ffmpeg from source.
         # bug ticket: http://ffmpeg.org/trac/ffmpeg/ticket/749
-	CMD="ffmpeg -i \"$tcUrl\" $ffmpeg_flags \"$filename\""
+	do_eval "ffmpeg -i \"$tcUrl\" $ffmpeg_flags \"$filename\""
     elif [ "$extension" == "mp4" ]; then
-	CMD="rtmpdump -r \"$tcUrl\" -W \"$swfUrl\" -o \"$filename\""
+	do_eval "rtmpdump -r \"$tcUrl\" -W \"$swfUrl\" -o \"$filename\""
     elif [ $extension == "flv" ]; then
-	CMD="curl \"$tcUrl\" -o \"$filename\""
+	do_eval "curl \"$tcUrl\" -o \"$filename\""
     fi
 fi
 
-debug "$CMD"
-if [ $debug ]; then
-    exit 0
-fi
-
-eval $CMD
+exit 0
